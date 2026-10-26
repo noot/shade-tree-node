@@ -8,6 +8,9 @@
 
 pub mod artifacts;
 pub mod identity;
+#[cfg(feature = "prove")]
 pub mod prover;
 pub mod tree;
+pub mod verify;
+#[cfg(feature = "prove")]
 pub mod withdraw;

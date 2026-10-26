@@ -20,8 +20,9 @@ reference. The Rust SDK and the JavaScript SDK both test against them
 crates/
 ├── shadenet/         THE RUST SDK: Client, config, status, connect, fetch, the local proxy
 ├── shadenet-cli/     the `shadenet` binary (also installed as `shade-tree` for one minor release)
+├── shadenet-node/    the `shadenet-node` binary: the egress node (ADR 0014, in progress)
 ├── shadenet-proto/   canonical bytes, signatures, selection, receipts (no I/O)
-└── shadenet-rln/     RLN proving, verification, and artifact bindings
+└── shadenet-rln/     RLN proving (`prove` feature), verification, and artifact bindings
 ```
 
 `shadenet-proto` owns every deterministic security decision and has no I/O or

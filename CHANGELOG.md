@@ -4,6 +4,22 @@ ShadeNet was formerly Shade Tree Grove; entries below keep the names they shippe
 
 ## Unreleased
 
+### The node moves to Rust: foundations (ADR 0014)
+
+- New crate `crates/shadenet-node` and binary `shadenet-node`. One entrypoint: `main.rs` resolves
+  a `Config` from `SHADENET_*` / `SHADE_TREE_*` and hands it to `ShadeNode`. This first slice
+  listens on `127.0.0.1:$SHADE_TREE_GATEWAY_PORT`, applies the connection cap, the 64 KiB
+  envelope line with its deadline, the protocol version gate and the egress target policy, and
+  answers each refusal byte for byte as the JavaScript node does. Proof verification is not wired
+  in yet: a well-formed v4 envelope is answered `gateway-error` and logged. Sessions answer
+  `session-unsupported`. SIGTERM drains open connections for `SHADE_TREE_SHUTDOWN_TIMEOUT_MS`.
+- `shadenet-rln` gains a `verify` module (snarkjs key and proof parsing with curve and subgroup
+  checks, Groth16 pairing check) that the prover and the withdraw builder now use for their
+  self-checks, and a default-on `prove` feature. With `--no-default-features` the crate is the
+  tree, the identity math and `verify`, with no witness calculator or wasmer, which is what a
+  node links.
+- Known JavaScript node behaviours the port will not copy are listed in the ADR.
+
 ### RPC: a rate-limited endpoint is waited on, not failed (roadmap #369 M0)
 
 - HTTP 429, and 503 with `Retry-After`, are resent with bounded exponential backoff and jitter
