@@ -212,6 +212,14 @@ impl Refusal {
     }
 }
 
+/// What the proof's public `x` must be the hash of.
+pub(crate) enum Binding {
+    /// A v4 tunnel: `requestSignal(target, nonce)` from the envelope's own fields.
+    Target,
+    /// A session initialization: the signal rebuilt from the validated `session` fields.
+    Signal(String),
+}
+
 pub(crate) struct Verifier {
     artifacts: Arc<ArtifactSet>,
     epoch_seconds: u64,
@@ -253,6 +261,7 @@ impl Verifier {
         &self,
         envelope: &Value,
         roots: &HashSet<String>,
+        binding: Binding,
     ) -> Result<Verified, Refusal> {
         let proof = &envelope["proof"];
         let snark = &proof["snarkProof"];
@@ -280,20 +289,31 @@ impl Verifier {
             return Err(Refusal::reason("signal-mismatch"));
         }
 
-        let (Some(target), Some(nonce)) = (
-            envelope.get("target").filter(|v| !v.is_null()),
-            envelope.get("nonce").filter(|v| !v.is_null()),
-        ) else {
-            return Err(Refusal::reason("unbound-target"));
-        };
-        let (Some(target), Some(nonce)) = (target.as_str(), nonce.as_str()) else {
-            return Err(Refusal::reason("bad-signal-field"));
-        };
-        if !signal_field_safe(target, TARGET_MAX_LEN) || !signal_field_safe(nonce, NONCE_MAX_LEN) {
-            return Err(Refusal::reason("bad-signal-field"));
-        }
-        if calculate_signal_hash(&request_signal(target, nonce)) != x {
-            return Err(Refusal::reason("target-not-bound"));
+        match binding {
+            Binding::Target => {
+                let (Some(target), Some(nonce)) = (
+                    envelope.get("target").filter(|v| !v.is_null()),
+                    envelope.get("nonce").filter(|v| !v.is_null()),
+                ) else {
+                    return Err(Refusal::reason("unbound-target"));
+                };
+                let (Some(target), Some(nonce)) = (target.as_str(), nonce.as_str()) else {
+                    return Err(Refusal::reason("bad-signal-field"));
+                };
+                if !signal_field_safe(target, TARGET_MAX_LEN)
+                    || !signal_field_safe(nonce, NONCE_MAX_LEN)
+                {
+                    return Err(Refusal::reason("bad-signal-field"));
+                }
+                if calculate_signal_hash(&request_signal(target, nonce)) != x {
+                    return Err(Refusal::reason("target-not-bound"));
+                }
+            }
+            Binding::Signal(signal) => {
+                if calculate_signal_hash(&signal) != x {
+                    return Err(Refusal::reason("session-not-bound"));
+                }
+            }
         }
 
         let root = signal("root");

@@ -15,6 +15,7 @@ use crate::chain::{Contract, Kind};
 use crate::egress;
 use crate::error::Error;
 use crate::rpc;
+use crate::session;
 use crate::verify::ArtifactSet;
 
 const DEFAULT_PORT: u16 = 8443;
@@ -66,7 +67,15 @@ pub struct Config {
     artifacts: Arc<ArtifactSet>,
     spent_state_file: Option<PathBuf>,
     identity_file: Option<PathBuf>,
+    receipts: bool,
+    sessions: Option<SessionConfig>,
     egress: egress::Policy,
+}
+
+/// Session tickets (`SHADE_TREE_SESSION_TICKETS=1`).
+pub(crate) struct SessionConfig {
+    pub(crate) max_sessions: usize,
+    pub(crate) stream_max: Option<Duration>,
 }
 
 impl Config {
@@ -239,14 +248,31 @@ impl Config {
             .map(|raw| raw.trim().to_string())
             .filter(|raw| !raw.is_empty() && !raw.eq_ignore_ascii_case("off"))
             .map(PathBuf::from);
-        let identity_file = if env_str("RECEIPTS")?.as_deref() == Some("1") {
+        let receipts = env_str("RECEIPTS")?.as_deref() == Some("1");
+        let sessions = if env_str("SESSION_TICKETS")?.as_deref() == Some("1") {
+            Some(SessionConfig {
+                max_sessions: count(env_int("SESSION_MAX", session::DEFAULT_MAX_SESSIONS)?)
+                    .unwrap_or(usize::MAX),
+                stream_max: millis(env_int(
+                    "SESSION_STREAM_MAX_MS",
+                    session::DEFAULT_STREAM_MAX_MS,
+                )?),
+            })
+        } else {
+            None
+        };
+        let identity_file = if receipts || sessions.is_some() {
             Some(
                 env_str("GW_IDENTITY")?
                     .filter(|raw| !raw.trim().is_empty())
                     .map(PathBuf::from)
                     .ok_or_else(|| Error::Setting {
                         name: "SHADE_TREE_GW_IDENTITY",
-                        message: "is required when SHADE_TREE_RECEIPTS=1".into(),
+                        message: if receipts {
+                            "is required when SHADE_TREE_RECEIPTS=1".into()
+                        } else {
+                            "is required when SHADE_TREE_SESSION_TICKETS=1 (a book binds to this node's onion)".into()
+                        },
                     })?,
             )
         } else {
@@ -280,6 +306,8 @@ impl Config {
             artifacts,
             spent_state_file,
             identity_file,
+            receipts,
+            sessions,
             egress: egress::Policy::parse(&allow, &deny),
         })
     }
@@ -370,6 +398,14 @@ impl Config {
 
     pub(crate) fn identity_file(&self) -> Option<&PathBuf> {
         self.identity_file.as_ref()
+    }
+
+    pub(crate) fn receipts(&self) -> bool {
+        self.receipts
+    }
+
+    pub(crate) fn sessions(&self) -> Option<&SessionConfig> {
+        self.sessions.as_ref()
     }
 
     pub(crate) fn egress(&self) -> &egress::Policy {

@@ -113,15 +113,84 @@ impl Budget {
     }
 }
 
+/// A token bucket: `take(n)` is how long `n` bytes must wait before they may pass.
+struct TokenBucket {
+    tokens: f64,
+    at: Instant,
+    rate: f64,
+    burst: f64,
+}
+
+impl TokenBucket {
+    fn new(bytes_per_second: u64, burst_bytes: u64) -> Self {
+        Self {
+            tokens: burst_bytes as f64,
+            at: Instant::now(),
+            rate: bytes_per_second as f64,
+            burst: burst_bytes as f64,
+        }
+    }
+
+    fn take(&mut self, n: usize) -> Duration {
+        let now = Instant::now();
+        self.tokens =
+            (self.tokens + now.duration_since(self.at).as_secs_f64() * self.rate).min(self.burst);
+        self.at = now;
+        self.tokens -= n as f64;
+        if self.tokens >= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-self.tokens / self.rate)
+        }
+    }
+}
+
+/// Per-book shaping (ADR 0011): one bucket per direction shared by every stream of the book,
+/// so opening six streams never multiplies the advertised rate, plus the book's payload clock.
+pub(crate) struct Shaping {
+    up: Mutex<TokenBucket>,
+    down: Mutex<TokenBucket>,
+    last_payload: Mutex<Instant>,
+}
+
+impl Shaping {
+    pub(crate) fn new(up_rate: u64, up_burst: u64, down_rate: u64, down_burst: u64) -> Self {
+        Self {
+            up: Mutex::new(TokenBucket::new(up_rate, up_burst)),
+            down: Mutex::new(TokenBucket::new(down_rate, down_burst)),
+            last_payload: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn delay(&self, direction: Direction, bytes: usize) -> Duration {
+        let bucket = match direction {
+            Direction::AgentToDestination => &self.up,
+            Direction::DestinationToAgent => &self.down,
+        };
+        bucket.lock().unwrap_or_else(|e| e.into_inner()).take(bytes)
+    }
+
+    fn touch(&self) {
+        *self.last_payload.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    }
+
+    pub(crate) fn last_payload(&self) -> Instant {
+        *self.last_payload.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// How an established tunnel ended, for the close log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Close {
-    /// Both directions reached end of stream.
+    /// A side reached end of stream. Neither socket allows half-open: like the JavaScript
+    /// node's, a FIN from either peer ends the whole tunnel.
     Peer,
     IdleTimeout,
     PayloadLimit,
     UpstreamError,
     ClientError,
+    /// The session book closed or the stream hit its hard cap.
+    Session,
 }
 
 impl Close {
@@ -132,6 +201,7 @@ impl Close {
             Self::PayloadLimit => "payload-limit",
             Self::UpstreamError => "upstream-error",
             Self::ClientError => "client-error",
+            Self::Session => "session",
         }
     }
 }
@@ -170,6 +240,8 @@ pub(crate) async fn relay(
     early: Vec<u8>,
     hold: Hold,
     idle_timeout: Option<Duration>,
+    shaping: Option<Arc<Shaping>>,
+    cancel: Option<Arc<tokio::sync::Notify>>,
 ) -> Close {
     let budget = Arc::clone(&hold.budget);
     let key = Arc::new(hold.key.clone());
@@ -185,6 +257,7 @@ pub(crate) async fn relay(
         Arc::clone(&budget),
         Arc::clone(&key),
         Arc::clone(&activity),
+        shaping.clone(),
     ));
     pumps.spawn(pump(
         Direction::DestinationToAgent,
@@ -194,37 +267,43 @@ pub(crate) async fn relay(
         budget,
         key,
         Arc::clone(&activity),
+        shaping,
     ));
-    let close = loop {
-        let idle = async {
-            match idle_timeout {
-                Some(limit) => loop {
-                    let since = activity.since_last();
-                    if since >= limit {
-                        break;
-                    }
-                    tokio::time::sleep(limit - since).await;
-                },
-                None => std::future::pending().await,
-            }
-        };
-        tokio::select! {
-            joined = pumps.join_next() => match joined {
-                None => break Close::Peer,
-                Some(Ok((_, Pump::Eof))) => continue,
-                Some(Ok((_, Pump::Limit))) => break Close::PayloadLimit,
-                Some(Ok((Direction::AgentToDestination, Pump::Failed))) => break Close::ClientError,
-                Some(Ok((Direction::DestinationToAgent, Pump::Failed))) => break Close::UpstreamError,
-                Some(Err(_)) => break Close::ClientError,
+    let idle = async {
+        match idle_timeout {
+            Some(limit) => loop {
+                let since = activity.since_last();
+                if since >= limit {
+                    break;
+                }
+                tokio::time::sleep(limit - since).await;
             },
-            () = idle => break Close::IdleTimeout,
+            None => std::future::pending().await,
         }
+    };
+    let cancelled = async {
+        match &cancel {
+            Some(notify) => notify.notified().await,
+            None => std::future::pending().await,
+        }
+    };
+    let close = tokio::select! {
+        joined = pumps.join_next() => match joined {
+            None | Some(Ok((_, Pump::Eof))) => Close::Peer,
+            Some(Ok((_, Pump::Limit))) => Close::PayloadLimit,
+            Some(Ok((Direction::AgentToDestination, Pump::Failed))) => Close::ClientError,
+            Some(Ok((Direction::DestinationToAgent, Pump::Failed))) => Close::UpstreamError,
+            Some(Err(_)) => Close::ClientError,
+        },
+        () = idle => Close::IdleTimeout,
+        () = cancelled => Close::Session,
     };
     pumps.abort_all();
     drop(hold);
     close
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     direction: Direction,
     mut reader: OwnedReadHalf,
@@ -233,6 +312,7 @@ async fn pump(
     budget: Arc<Budget>,
     key: Arc<String>,
     activity: Arc<Activity>,
+    shaping: Option<Arc<Shaping>>,
 ) -> (Direction, Pump) {
     let mut chunk = vec![0_u8; CHUNK];
     let mut pending = early;
@@ -240,10 +320,19 @@ async fn pump(
         if !pending.is_empty() {
             let (allowed, exhausted) = budget.take(&key, pending.len());
             if allowed > 0 {
+                if let Some(shaping) = &shaping {
+                    let delay = shaping.delay(direction, allowed);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
                 if writer.write_all(&pending[..allowed]).await.is_err() {
                     return (direction, Pump::Failed);
                 }
                 activity.touch();
+                if let Some(shaping) = &shaping {
+                    shaping.touch();
+                }
             }
             if exhausted {
                 let _ = writer.flush().await;
@@ -339,7 +428,15 @@ mod tests {
         let upstream = TcpStream::connect(sink_addr).await.unwrap();
         let budget = Arc::new(Budget::new(12, 60));
         let hold = budget.acquire(Budget::key("e", "n")).unwrap();
-        let relay = tokio::spawn(relay(client, upstream, b"early".to_vec(), hold, None));
+        let relay = tokio::spawn(relay(
+            client,
+            upstream,
+            b"early".to_vec(),
+            hold,
+            None,
+            None,
+            None,
+        ));
         let mut reply = [0_u8; 4];
         agent.read_exact(&mut reply).await.unwrap();
         assert_eq!(&reply, b"pong");

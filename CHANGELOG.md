@@ -28,9 +28,16 @@ ShadeNet was formerly Shade Tree Grove; entries below keep the names they shippe
   `SHADE_TREE_SLASH_KEY`, an over-spend is slashed on chain: the contracts are probed for the
   tiered ABI, the first one that holds a live leaf of the secret gets `slash(..)`, signed by
   `shadenet::eth`, and the reply to the client no longer waits for the transaction.
+  Session tickets (`SHADE_TREE_SESSION_TICKETS=1` with the onion identity in
+  `SHADE_TREE_GW_IDENTITY`): an initialization proof bound to this node's onion opens a book of
+  `research-v1` or `research-v2` tickets; each ticket opens a tunnel with a proof-less envelope
+  under the book's concurrency and pending-connect caps, two shared token buckets per direction,
+  the proof slot's payload allowance, the book's idle clock and the per-stream hard cap
+  (`SHADE_TREE_SESSION_MAX`, `SHADE_TREE_SESSION_STREAM_MAX_MS`). The lifetime ends spends, not
+  streams. Unlike the JavaScript node, a session initialization refused at verification carries
+  the same `gate:` prefix as a tunnel; clients already strip it.
   Not yet: the light-client root provider (`SHADE_TREE_ROOT_PROVIDER=light` is refused),
-  session tickets (answered `session-unsupported`), metrics, the heartbeat and the Tor
-  supervisor.
+  metrics, the heartbeat and the Tor supervisor.
 - `shadenet-rln` gains `replay`, the pure member-event replay the SDK's `leaves` module now
   re-exports, so the node and the client rebuild the same tree from the same code.
 - The interop harness (`crates/shadenet-rln/interop/*.sh`) takes `SHADE_TREE_GATEWAY_CMD` and

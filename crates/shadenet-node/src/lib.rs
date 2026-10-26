@@ -17,6 +17,7 @@ mod node;
 mod receipt;
 mod roots;
 mod rpc;
+mod session;
 mod slash;
 mod spent;
 mod tunnel;

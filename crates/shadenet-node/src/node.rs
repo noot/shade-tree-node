@@ -21,10 +21,11 @@ use crate::members::MemberSet;
 use crate::receipt;
 use crate::roots::Roots;
 use crate::rpc::Rpc;
+use crate::session;
 use crate::slash::{self, SlashConfig, Slasher};
 use crate::spent::{Admission, Share, SpentSet};
 use crate::tunnel::{self, Budget};
-use crate::verify::{Refusal, Verifier};
+use crate::verify::{Binding, Refusal, Verified, Verifier};
 
 const REASON_TOO_MANY_CONNECTIONS: &str = "too-many-connections";
 const REASON_SESSION_UNSUPPORTED: &str = "session-unsupported";
@@ -47,6 +48,12 @@ struct Shared {
     spent: Arc<SpentSet>,
     budget: Arc<Budget>,
     receipts: Option<receipt::Signer>,
+    sessions: Option<Sessions>,
+}
+
+struct Sessions {
+    onion: String,
+    books: Arc<session::Books>,
 }
 
 impl ShadeNode {
@@ -133,18 +140,41 @@ impl ShadeNode {
         )
         .await
         .map_err(Error::Slash)?;
-        let receipts = match config.identity_file() {
-            Some(path) => match receipt::Signer::load(path) {
-                Ok(signer) => {
-                    tracing::info!("egress receipts enabled (signer: onion control key)");
-                    Some(signer)
+        let identity = match config.identity_file() {
+            Some(path) => {
+                match receipt::Signer::load(path) {
+                    Ok(identity) => Some(identity),
+                    Err(e) => {
+                        tracing::warn!("onion identity unavailable; receipts and session tickets DISABLED: {e}");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("receipts requested (SHADE_TREE_RECEIPTS=1) but identity unavailable; receipts DISABLED: {e}");
-                    None
-                }
-            },
+            }
             None => None,
+        };
+        let sessions = match (config.sessions(), &identity) {
+            (Some(settings), Some(identity)) => {
+                tracing::info!(
+                    onion = identity.onion(),
+                    classes = session::CLASSES.map(|c| c.class).join(","),
+                    "session tickets enabled"
+                );
+                Some(Sessions {
+                    onion: identity.onion(),
+                    books: Arc::new(session::Books::new(
+                        settings.max_sessions,
+                        settings.stream_max,
+                    )),
+                })
+            }
+            _ => None,
+        };
+        let receipts = match (config.receipts(), identity) {
+            (true, Some(identity)) => {
+                tracing::info!("egress receipts enabled (signer: onion control key)");
+                Some(identity)
+            }
+            _ => None,
         };
         let spent = Arc::new(SpentSet::new(
             config.epoch_seconds(),
@@ -182,6 +212,7 @@ impl ShadeNode {
             spent: Arc::clone(&spent),
             budget,
             receipts,
+            sessions,
             config,
         });
         let mut background = JoinSet::new();
@@ -190,6 +221,9 @@ impl ShadeNode {
         }
         if let Some(chain) = chain {
             background.spawn(chain.poll());
+        }
+        if let Some(sessions) = &shared.sessions {
+            background.spawn(Arc::clone(&sessions.books).sweep());
         }
         background.spawn(async move { spent.flush_periodically().await });
         tracing::info!("gateway up on {bound}");
@@ -306,8 +340,16 @@ async fn serve(shared: Arc<Shared>, mut stream: TcpStream) {
         return;
     }
     if envelope.get("session").is_some() || envelope.get("ticket").is_some() {
-        tracing::debug!(reason = REASON_SESSION_UNSUPPORTED, "tunnel rejected");
-        refuse(&mut stream, &refusal(REASON_SESSION_UNSUPPORTED, &[])).await;
+        let Some(sessions) = &shared.sessions else {
+            tracing::debug!(reason = REASON_SESSION_UNSUPPORTED, "tunnel rejected");
+            refuse(&mut stream, &refusal(REASON_SESSION_UNSUPPORTED, &[])).await;
+            return;
+        };
+        if envelope.get("session").is_some() {
+            session_init(&shared, sessions, stream, &envelope).await;
+        } else {
+            ticket_spend(&shared, sessions, stream, &envelope, early).await;
+        }
         return;
     }
     let target = match shared.config.egress().check_target(envelope.get("target")) {
@@ -321,62 +363,21 @@ async fn serve(shared: Arc<Shared>, mut stream: TcpStream) {
 
     let verified = match shared
         .verifier
-        .verify(&envelope, &shared.roots.accepted())
+        .verify(&envelope, &shared.roots.accepted(), Binding::Target)
         .await
     {
         Ok(verified) => verified,
-        Err(Refusal::Reason(reason)) => {
-            tracing::debug!(reason, "tunnel rejected");
-            refuse(&mut stream, &refusal(&format!("gate:{reason}"), &[])).await;
-            return;
-        }
-        Err(Refusal::WrongRoot) => {
-            tracing::debug!(reason = "wrong-group-root", "tunnel rejected");
-            let extras = shared.roots.advert(ROOT_ADVERT_MAX);
-            refuse(&mut stream, &refusal("gate:wrong-group-root", &extras)).await;
-            return;
-        }
-        Err(Refusal::Artifact { reason, ids }) => {
-            tracing::debug!(reason, "tunnel rejected");
-            let ids = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into());
-            refuse(
-                &mut stream,
-                &refusal(&format!("gate:{reason}"), &[("artifacts", ids)]),
-            )
-            .await;
+        Err(refusal) => {
+            refuse_verification(&shared, &mut stream, refusal).await;
             return;
         }
     };
 
-    let share = Share {
-        x: verified.share_x.clone(),
-        y: verified.share_y.clone(),
-    };
     let nonce = envelope.get("nonce").and_then(|v| v.as_str());
-    match shared.spent.admit(&verified.nullifier, share, nonce) {
-        Admission::First | Admission::Replay => {}
-        Admission::Refused(reason) => {
-            tracing::debug!(reason, "tunnel rejected");
-            refuse(&mut stream, &refusal(reason, &[])).await;
-            return;
-        }
-        Admission::OverSpend { first, second } => {
-            match slash::reconstruct_secret(&first, &second) {
-                Ok(secret) => {
-                    let tier = slash::resolve_tier(
-                        secret,
-                        shared.config.tiers(),
-                        shared.config.slots(),
-                        |leaf| shared.roots.has_leaf(leaf),
-                    );
-                    shared.slasher.submit(secret, tier);
-                }
-                Err(e) => tracing::error!(reason = "slash-submit-failed", "slash failed: {e}"),
-            }
-            tracing::debug!(reason = REASON_OVER_SPEND_SLASHED, "tunnel rejected");
-            refuse(&mut stream, &refusal(REASON_OVER_SPEND_SLASHED, &[])).await;
-            return;
-        }
+    if let Err(reason) = admit(&shared, &verified, nonce) {
+        tracing::debug!(reason, "tunnel rejected");
+        refuse(&mut stream, &refusal(reason, &[])).await;
+        return;
     }
 
     let Some(_nullifier_slot) = NullifierSlot::acquire(&shared, &verified.nullifier) else {
@@ -429,8 +430,252 @@ async fn serve(shared: Arc<Shared>, mut stream: TcpStream) {
     if !write_line(&mut stream, &ack).await {
         return;
     }
-    let close = tunnel::relay(stream, upstream, early, hold, shared.config.idle_timeout()).await;
+    let close = tunnel::relay(
+        stream,
+        upstream,
+        early,
+        hold,
+        shared.config.idle_timeout(),
+        None,
+        None,
+    )
+    .await;
     tracing::debug!(reason = close.label(), "tunnel closed");
+}
+
+/// Every verification refusal's wire form, shared by the tunnel and session paths.
+async fn refuse_verification(shared: &Shared, stream: &mut TcpStream, refusal_: Refusal) {
+    match refusal_ {
+        Refusal::Reason(reason) => {
+            tracing::debug!(reason, "tunnel rejected");
+            refuse(stream, &refusal(&format!("gate:{reason}"), &[])).await;
+        }
+        Refusal::WrongRoot => {
+            tracing::debug!(reason = "wrong-group-root", "tunnel rejected");
+            let extras = shared.roots.advert(ROOT_ADVERT_MAX);
+            refuse(stream, &refusal("gate:wrong-group-root", &extras)).await;
+        }
+        Refusal::Artifact { reason, ids } => {
+            tracing::debug!(reason, "tunnel rejected");
+            let ids = serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into());
+            refuse(
+                stream,
+                &refusal(&format!("gate:{reason}"), &[("artifacts", ids)]),
+            )
+            .await;
+        }
+    }
+}
+
+/// The spent set's verdict on a verified proof; an over-spend is slashed here.
+fn admit(shared: &Shared, verified: &Verified, nonce: Option<&str>) -> Result<(), &'static str> {
+    let share = Share {
+        x: verified.share_x.clone(),
+        y: verified.share_y.clone(),
+    };
+    match shared.spent.admit(&verified.nullifier, share, nonce) {
+        Admission::First | Admission::Replay => Ok(()),
+        Admission::Refused(reason) => Err(reason),
+        Admission::OverSpend { first, second } => {
+            match slash::reconstruct_secret(&first, &second) {
+                Ok(secret) => {
+                    let tier = slash::resolve_tier(
+                        secret,
+                        shared.config.tiers(),
+                        shared.config.slots(),
+                        |leaf| shared.roots.has_leaf(leaf),
+                    );
+                    shared.slasher.submit(secret, tier);
+                }
+                Err(e) => tracing::error!(reason = "slash-submit-failed", "slash failed: {e}"),
+            }
+            Err(REASON_OVER_SPEND_SLASHED)
+        }
+    }
+}
+
+/// A session initialization: the same cheap-first order as a tunnel, then a book is opened and
+/// the ack echoes the policy. The socket is closed after the ack; a book, not a connection, is
+/// the session handle.
+async fn session_init(
+    shared: &Arc<Shared>,
+    sessions: &Sessions,
+    mut stream: TcpStream,
+    envelope: &serde_json::Value,
+) {
+    let init = match session::validate_init(&envelope["session"]) {
+        Ok(init) => init,
+        Err(reason) => {
+            tracing::debug!(reason, "session rejected");
+            refuse(&mut stream, &refusal(reason, &[])).await;
+            return;
+        }
+    };
+    if init.gateway != sessions.onion {
+        tracing::debug!(reason = "session-wrong-gateway", "session rejected");
+        refuse(&mut stream, &refusal("session-wrong-gateway", &[])).await;
+        return;
+    }
+    let signal = match shadenet_proto::session::session_signal(
+        &init.gateway,
+        &init.class,
+        &init.nonce,
+        &init.digest,
+    ) {
+        Ok(signal) => signal,
+        Err(_) => {
+            refuse(&mut stream, &refusal("session-malformed", &[])).await;
+            return;
+        }
+    };
+    let verified = match shared
+        .verifier
+        .verify(envelope, &shared.roots.accepted(), Binding::Signal(signal))
+        .await
+    {
+        Ok(verified) => verified,
+        Err(refusal) => {
+            refuse_verification(shared, &mut stream, refusal).await;
+            return;
+        }
+    };
+    if let Err(reason) = admit(shared, &verified, Some(&init.nonce)) {
+        tracing::debug!(reason, "session rejected");
+        refuse(&mut stream, &refusal(reason, &[])).await;
+        return;
+    }
+    let opened = match sessions
+        .books
+        .open(&init, &verified.nullifier, &verified.external_nullifier)
+    {
+        Ok(opened) => opened,
+        Err(reason) => {
+            tracing::debug!(reason, "session rejected");
+            refuse(&mut stream, &refusal(reason, &[])).await;
+            return;
+        }
+    };
+    tracing::debug!(
+        class = init.class,
+        replay = matches!(opened, session::Opened::Replay),
+        "session opened"
+    );
+    let ack = format!(
+        "{{\"ok\":true,\"session\":{{\"ticketBookDigest\":\"{}\",\"policy\":{}}}}}",
+        init.digest,
+        session::policy_echo(init.policy, sessions.books.stream_max())
+    );
+    refuse(&mut stream, &ack).await;
+}
+
+/// A ticket spend: grammar, target policy, the synchronous reservation, then the shared DNS,
+/// dial and relay path under the book's budget key, shapers and idle clock.
+async fn ticket_spend(
+    shared: &Arc<Shared>,
+    sessions: &Sessions,
+    mut stream: TcpStream,
+    envelope: &serde_json::Value,
+    early: Vec<u8>,
+) {
+    let ticket = match session::validate_ticket(&envelope["ticket"]) {
+        Ok(ticket) => ticket,
+        Err(reason) => {
+            tracing::debug!(reason, "ticket rejected");
+            refuse(&mut stream, &refusal(reason, &[])).await;
+            return;
+        }
+    };
+    let target = match shared.config.egress().check_target(envelope.get("target")) {
+        Ok(target) => target,
+        Err(reason) => {
+            tracing::debug!(reason, "ticket rejected");
+            refuse(&mut stream, &refusal(reason, &[])).await;
+            return;
+        }
+    };
+    let target_text = format!("{}:{}", target.host, target.port);
+    let reservation = match sessions.books.reserve(&ticket, &target_text) {
+        Ok(reservation) => reservation,
+        Err(reason) => {
+            tracing::debug!(reason, "ticket rejected");
+            refuse(&mut stream, &refusal(reason, &[])).await;
+            return;
+        }
+    };
+    let books = Arc::clone(&sessions.books);
+    let (epoch, nullifier) = &reservation.slot_key;
+    let Some(hold) = shared.budget.acquire(Budget::key(epoch, nullifier)) else {
+        tracing::debug!(
+            reason = shadenet_proto::REASON_PAYLOAD_LIMIT,
+            "ticket rejected"
+        );
+        books.stream_closed(&reservation);
+        refuse(
+            &mut stream,
+            &refusal(shadenet_proto::REASON_PAYLOAD_LIMIT, &[]),
+        )
+        .await;
+        return;
+    };
+    let cancel = Arc::clone(&reservation.cancel);
+    let dialed = tokio::select! {
+        dialed = async {
+            let candidates = egress::resolve(
+                &target,
+                shared.config.allow_private_targets(),
+                shared.config.dns_timeout(),
+            )
+            .await
+            .map_err(|reason| (reason.to_string(), true))?;
+            egress::dial(&candidates, shared.config.idle_timeout())
+                .await
+                .map_err(|reason| {
+                    let definite = reason != "upstream:ETIMEDOUT";
+                    (reason, definite)
+                })
+        } => dialed,
+        () = cancel.notified() => {
+            books.stream_closed(&reservation);
+            return;
+        }
+    };
+    let upstream = match dialed {
+        Ok(upstream) => upstream,
+        Err((reason, definite)) => {
+            tracing::debug!(reason, "ticket rejected");
+            if definite {
+                books.release(&reservation);
+            } else {
+                books.stream_closed(&reservation);
+            }
+            refuse(&mut stream, &refusal(&reason, &[])).await;
+            return;
+        }
+    };
+    if !books.spend(&reservation) {
+        books.stream_closed(&reservation);
+        return;
+    }
+    tracing::debug!(port = target.port, "tunnel established");
+    if !write_line(&mut stream, "{\"ok\":true}").await {
+        books.stream_closed(&reservation);
+        return;
+    }
+    let close = tunnel::relay(
+        stream,
+        upstream,
+        early,
+        hold,
+        shared.config.idle_timeout(),
+        Some(Arc::clone(&reservation.shaping)),
+        Some(cancel),
+    )
+    .await;
+    tracing::debug!(reason = close.label(), "tunnel closed");
+    if close == tunnel::Close::PayloadLimit {
+        books.close_book(&reservation.book, "payload-limit");
+    }
+    books.stream_closed(&reservation);
 }
 
 struct Shutdown {

@@ -37,6 +37,11 @@ impl Signer {
         })
     }
 
+    /// This node's onion, lowercase with its suffix: what a session initialization must name.
+    pub(crate) fn onion(&self) -> String {
+        shadenet_proto::session::normalize_onion(&self.onion)
+    }
+
     /// `{"ok":true,"receipt":{...}}`, the success acknowledgement with a receipt attached.
     pub(crate) fn ack(&self, epoch: u64) -> String {
         let epoch = epoch.to_string();
