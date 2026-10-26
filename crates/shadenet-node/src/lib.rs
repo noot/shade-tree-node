@@ -7,13 +7,16 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+mod chain;
 mod config;
 mod egress;
 mod envelope;
 mod error;
+mod members;
 mod node;
 mod receipt;
 mod roots;
+mod rpc;
 mod slash;
 mod spent;
 mod tunnel;

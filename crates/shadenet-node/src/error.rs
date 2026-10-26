@@ -22,6 +22,10 @@ pub enum Error {
     },
     #[error("{path}: {message}")]
     FileContent { path: PathBuf, message: String },
+    #[error("no admission root available: {0}")]
+    NoAdmissionRoot(String),
+    #[error("slash: {0}")]
+    Slash(String),
     #[error("failed to bind {addr}")]
     Bind {
         addr: SocketAddr,
@@ -53,7 +57,9 @@ impl Error {
             | Self::ReadFile { .. }
             | Self::ParseJson { .. }
             | Self::FileContent { .. } => 2,
-            Self::Bind { .. }
+            Self::NoAdmissionRoot(_)
+            | Self::Slash(_)
+            | Self::Bind { .. }
             | Self::LocalAddr { .. }
             | Self::Signal { .. }
             | Self::DrainTimeout { .. } => 1,

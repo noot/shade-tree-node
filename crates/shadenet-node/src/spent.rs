@@ -332,6 +332,7 @@ mod tests {
             Admission::Replay
         ));
 
+        std::thread::sleep(Duration::from_millis(2));
         let expired = SpentSet::new(0, Duration::from_secs(5), Some(path));
         assert!(matches!(
             expired.admit("n1", share("1"), Some("a")),

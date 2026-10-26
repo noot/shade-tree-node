@@ -79,6 +79,11 @@ jobs:
       - name: Check workspace (all targets and features)
         run: cargo check --workspace --all-targets --all-features --locked
 
+      - name: Install Foundry (Anvil, forge and cast for the on-chain tests)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: stable
+
       - name: Test workspace (all features)
         run: cargo test --workspace --all-features --locked
 
@@ -128,11 +133,6 @@ jobs:
         run: bash crates/shadenet-rln/interop/proxy-concurrency-run.sh
         env:
           SHADE_TREE_GATEWAY_CMD: ${{ github.workspace }}/target/debug/shadenet-node
-
-      - name: Install Foundry (Anvil + forge for the member lifecycle)
-        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
-        with:
-          version: stable
 
       - name: Rust member lifecycle on the real contracts (register, exit, withdraw) (blocking)
         run: bash crates/shadenet-rln/interop/member-lifecycle-run.sh

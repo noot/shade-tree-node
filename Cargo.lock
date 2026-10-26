@@ -5888,6 +5888,7 @@ dependencies = [
  "clap",
  "hex",
  "num-bigint",
+ "reqwest",
  "serde",
  "serde_json",
  "shadenet",

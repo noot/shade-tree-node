@@ -12,13 +12,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use crate::chain::ChainSource;
 use crate::config::Config;
 use crate::egress;
 use crate::envelope::{self, read_envelope, refusal, refuse, write_line};
 use crate::error::Error;
+use crate::members::MemberSet;
 use crate::receipt;
-use crate::roots::MemberSet;
-use crate::slash;
+use crate::roots::Roots;
+use crate::rpc::Rpc;
+use crate::slash::{self, SlashConfig, Slasher};
 use crate::spent::{Admission, Share, SpentSet};
 use crate::tunnel::{self, Budget};
 use crate::verify::{Refusal, Verifier};
@@ -39,7 +42,8 @@ struct Shared {
     connections: Option<Semaphore>,
     per_nullifier: Mutex<HashMap<String, usize>>,
     verifier: Verifier,
-    members: Arc<MemberSet>,
+    roots: Roots,
+    slasher: Slasher,
     spent: Arc<SpentSet>,
     budget: Arc<Budget>,
     receipts: Option<receipt::Signer>,
@@ -53,10 +57,82 @@ impl ShadeNode {
     /// Serve until SIGTERM or SIGINT, then drain open connections for the configured grace.
     pub async fn run(self) -> Result<(), Error> {
         let config = self.config;
-        let members = Arc::new(MemberSet::load(
-            config.members_file().clone(),
-            config.rln_identifier().clone(),
-        )?);
+        let members = match config.members_file() {
+            Some(path) => Some(Arc::new(MemberSet::load(
+                path.clone(),
+                config.rln_identifier().clone(),
+            )?)),
+            None => None,
+        };
+        let rln_id = config
+            .rln_identifier()
+            .to_u64_digits()
+            .first()
+            .copied()
+            .unwrap_or(1);
+        let mut rpc = None;
+        let chain = match config.chain() {
+            Some(chain_config) => {
+                let client = Arc::new(
+                    Rpc::new(
+                        chain_config.rpc_urls.clone(),
+                        chain_config.rpc_timeout,
+                        chain_config.rpc_retries,
+                    )
+                    .map_err(|message| Error::Setting {
+                        name: "SHADE_TREE_RPC_URL",
+                        message,
+                    })?,
+                );
+                rpc = Some(Arc::clone(&client));
+                let source = Arc::new(ChainSource::new(
+                    client,
+                    chain_config.contracts.clone(),
+                    chain_config.root_freshness,
+                    chain_config.confirmations,
+                    chain_config.logs_chunk,
+                    rln_id,
+                ));
+                let healthy = source.refresh().await;
+                if healthy == 0 && members.is_none() {
+                    return Err(Error::NoAdmissionRoot(
+                        "every on-chain root source failed its first read and no member file is admitted"
+                            .into(),
+                    ));
+                }
+                if healthy < chain_config.contracts.len() {
+                    tracing::warn!(
+                        "{} of {} on-chain root sources failed their first read; serving with the rest and retrying",
+                        chain_config.contracts.len() - healthy,
+                        chain_config.contracts.len()
+                    );
+                }
+                Some(source)
+            }
+            None => None,
+        };
+        let roots = Roots::new(members.clone(), chain.clone());
+        let slasher = Slasher::setup(
+            SlashConfig {
+                key: config.slash_key().map(str::to_string),
+                primary: config.slash_contract().map(str::to_string),
+                receiver: config.slash_receiver().map(str::to_string),
+                admitted: chain
+                    .as_ref()
+                    .map(|c| {
+                        c.contracts()
+                            .into_iter()
+                            .map(|c| (c.address, c.kind))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                tiers: config.tiers().to_vec(),
+                default_limit: config.slots(),
+            },
+            rpc,
+        )
+        .await
+        .map_err(Error::Slash)?;
         let receipts = match config.identity_file() {
             Some(path) => match receipt::Signer::load(path) {
                 Ok(signer) => {
@@ -88,7 +164,6 @@ impl ShadeNode {
             "accepted artifacts: {}",
             verifier.artifacts().ids().join(",")
         );
-        tracing::info!("slash: DRY-RUN (on-chain submission is not part of this build)");
 
         let addr = config.listen();
         let listener = TcpListener::bind(addr)
@@ -102,14 +177,20 @@ impl ShadeNode {
             connections: config.max_connections().map(Semaphore::new),
             per_nullifier: Mutex::new(HashMap::new()),
             verifier,
-            members: Arc::clone(&members),
+            roots,
+            slasher,
             spent: Arc::clone(&spent),
             budget,
             receipts,
             config,
         });
         let mut background = JoinSet::new();
-        background.spawn(members.watch());
+        if let Some(members) = members {
+            background.spawn(members.watch());
+        }
+        if let Some(chain) = chain {
+            background.spawn(chain.poll());
+        }
         background.spawn(async move { spent.flush_periodically().await });
         tracing::info!("gateway up on {bound}");
 
@@ -240,7 +321,7 @@ async fn serve(shared: Arc<Shared>, mut stream: TcpStream) {
 
     let verified = match shared
         .verifier
-        .verify(&envelope, &shared.members.roots())
+        .verify(&envelope, &shared.roots.accepted())
         .await
     {
         Ok(verified) => verified,
@@ -251,18 +332,8 @@ async fn serve(shared: Arc<Shared>, mut stream: TcpStream) {
         }
         Err(Refusal::WrongRoot) => {
             tracing::debug!(reason = "wrong-group-root", "tunnel rejected");
-            let roots: Vec<String> = shared
-                .members
-                .roots()
-                .into_iter()
-                .take(ROOT_ADVERT_MAX)
-                .collect();
-            let roots = serde_json::to_string(&roots).unwrap_or_else(|_| "[]".into());
-            refuse(
-                &mut stream,
-                &refusal("gate:wrong-group-root", &[("roots", roots)]),
-            )
-            .await;
+            let extras = shared.roots.advert(ROOT_ADVERT_MAX);
+            refuse(&mut stream, &refusal("gate:wrong-group-root", &extras)).await;
             return;
         }
         Err(Refusal::Artifact { reason, ids }) => {
@@ -296,9 +367,9 @@ async fn serve(shared: Arc<Shared>, mut stream: TcpStream) {
                         secret,
                         shared.config.tiers(),
                         shared.config.slots(),
-                        |leaf| shared.members.has_leaf(leaf),
+                        |leaf| shared.roots.has_leaf(leaf),
                     );
-                    slash::dry_run(&tier);
+                    shared.slasher.submit(secret, tier);
                 }
                 Err(e) => tracing::error!(reason = "slash-submit-failed", "slash failed: {e}"),
             }

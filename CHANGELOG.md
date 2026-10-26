@@ -17,8 +17,22 @@ ShadeNet was formerly Shade Tree Grove; entries below keep the names they shippe
   and by retries, public-address-only DNS, pinned sequential dial under one deadline, signed
   receipts (`SHADE_TREE_RECEIPTS=1`), the spent-set snapshot file, and the relay with one idle
   timer. Every acknowledgement and refusal is byte for byte what the JavaScript node sends.
-  Not yet: on-chain roots (`SHADE_TREE_ADMIT=staked|paid` is refused at startup), session
-  tickets (answered `session-unsupported`), metrics, the heartbeat and the Tor supervisor.
+  On-chain admission (`SHADE_TREE_ADMIT=staked,paid` with `SHADE_TREE_GROUP_CONTRACT` and
+  `SHADE_TREE_PAID_ACCESS_CONTRACT`): the member events are replayed into the tree on the
+  `finalized` tag (or head minus `SHADE_TREE_CONFIRMATIONS`), checked against the contract's
+  `nextIndex`/`activeCount` with page halving on a partial log, scanned incrementally, and kept
+  as a time-bounded set of recent roots (`SHADE_TREE_ROOT_FRESHNESS_SECONDS`), with the last
+  known good root served through an RPC outage and admission failing closed past the window.
+  `SHADE_TREE_RPC_URL` takes up to five endpoints with sticky failover, retryable JSON-RPC
+  errors moving on, and 429 / 503 `Retry-After` backoff on the last one. With
+  `SHADE_TREE_SLASH_KEY`, an over-spend is slashed on chain: the contracts are probed for the
+  tiered ABI, the first one that holds a live leaf of the secret gets `slash(..)`, signed by
+  `shadenet::eth`, and the reply to the client no longer waits for the transaction.
+  Not yet: the light-client root provider (`SHADE_TREE_ROOT_PROVIDER=light` is refused),
+  session tickets (answered `session-unsupported`), metrics, the heartbeat and the Tor
+  supervisor.
+- `shadenet-rln` gains `replay`, the pure member-event replay the SDK's `leaves` module now
+  re-exports, so the node and the client rebuild the same tree from the same code.
 - The interop harness (`crates/shadenet-rln/interop/*.sh`) takes `SHADE_TREE_GATEWAY_CMD` and
   passes the member set through `SHADE_TREE_MEMBERS_FILE` instead of overwriting
   `group/members.json`; CI runs the four plain-TCP scripts against both nodes.
