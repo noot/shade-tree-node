@@ -122,10 +122,16 @@ pub(crate) fn refusal(reason: &str, extras: &[(&str, String)]) -> String {
     line
 }
 
-pub(crate) async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) {
+/// Write one reply line. Returns false when the peer is gone.
+pub(crate) async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) -> bool {
     let mut bytes = line.as_bytes().to_vec();
     bytes.push(b'\n');
-    if writer.write_all(&bytes).await.is_ok() {
+    writer.write_all(&bytes).await.is_ok()
+}
+
+/// Write a refusal and close the connection.
+pub(crate) async fn refuse<W: AsyncWrite + Unpin>(writer: &mut W, line: &str) {
+    if write_line(writer, line).await {
         let _ = writer.shutdown().await;
     }
 }

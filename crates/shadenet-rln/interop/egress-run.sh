@@ -20,6 +20,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
+# The node under test: the JavaScript gateway by default, or a Rust shadenet-node binary
+# (ADR 0014) when SHADE_TREE_GATEWAY_CMD names it. Both read the same SHADE_TREE_* variables.
+GATEWAY_CMD="${SHADE_TREE_GATEWAY_CMD:-node $REPO/packages/node/gateway/gateway.mjs}"
 CIRCUITS="$REPO/circuits/rln"
 WORK="$(mktemp -d)"
 
@@ -33,13 +36,10 @@ TARGET="127.0.0.1:${SINK_PORT}"
 # checks this-or-previous epoch, so a boundary straddle during proving is still accepted.
 
 GW_PID="" ; VS_PID="" ; SINK_PID=""
-MEMBERS_BAK=""
 cleanup() {
   [ -n "$GW_PID" ]   && kill "$GW_PID"   2>/dev/null || true
   [ -n "$VS_PID" ]   && kill "$VS_PID"   2>/dev/null || true
   [ -n "$SINK_PID" ] && kill "$SINK_PID" 2>/dev/null || true
-  # restore the repo's group/members.json (layer 3 overwrites it as the gateway root source)
-  [ -n "$MEMBERS_BAK" ] && [ -f "$MEMBERS_BAK" ] && mv -f "$MEMBERS_BAK" "$REPO/group/members.json" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -75,11 +75,6 @@ echo "LAYER 2 OK"
 
 echo
 echo "== LAYER 3: full gateway proxy ACCEPT (packages/node/gateway/gateway.mjs) =="
-# Point the gateway's PoC root source at our derived member set (backup + restore in trap).
-MEMBERS_BAK="$WORK/members.json.repo-bak"
-cp "$REPO/group/members.json" "$MEMBERS_BAK"
-cp "$MEMBERS" "$REPO/group/members.json"
-
 # A local echo sink proves that Rust keeps the accepted socket and relays actual
 # application payload bytes after the acknowledgement (issue #76), not merely the ack.
 node -e 'const net=require("net"); net.createServer(s=>s.once("data",d=>{console.error("[sink] payload="+d);s.end("shade-tree-payload-ok:"+d)})).listen('"$SINK_PORT"',"127.0.0.1",()=>console.error("[sink] up on 127.0.0.1:'"$SINK_PORT"'"));' > "$WORK/sink.log" 2>&1 &
@@ -90,8 +85,8 @@ node "$HERE/wait-log.mjs" "$WORK/sink.log" "[sink] up" 15000
 # Start the real gateway. Allow ONLY our local sink target; default epoch length.
 # Wait on the gateway's OWN "gateway up" log line (never a TCP connect-probe: the gateway
 # reads a full newline-terminated envelope, and a half-open probe would EPIPE-crash it).
-SHADE_TREE_EGRESS_ALLOW="$TARGET" SHADE_TREE_ALLOW_PRIVATE_TARGETS=1 SHADE_TREE_EPOCH_SECONDS=120 \
-  node "$REPO/packages/node/gateway/gateway.mjs" > "$WORK/gw.log" 2>&1 &
+SHADE_TREE_MEMBERS_FILE="$MEMBERS" SHADE_TREE_EGRESS_ALLOW="$TARGET" SHADE_TREE_ALLOW_PRIVATE_TARGETS=1 SHADE_TREE_EPOCH_SECONDS=120 \
+  $GATEWAY_CMD > "$WORK/gw.log" 2>&1 &
 GW_PID=$!
 disown "$GW_PID" 2>/dev/null || true
 node "$HERE/wait-log.mjs" "$WORK/gw.log" "gateway up on" 20000

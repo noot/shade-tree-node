@@ -20,6 +20,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
+# The node under test: the JavaScript gateway by default, or a Rust shadenet-node binary
+# (ADR 0014) when SHADE_TREE_GATEWAY_CMD names it. Both read the same SHADE_TREE_* variables.
+GATEWAY_CMD="${SHADE_TREE_GATEWAY_CMD:-node $REPO/packages/node/gateway/gateway.mjs}"
 WORK="$(mktemp -d)"
 
 GW_PORT="${SHADENET_CONCURRENCY_GATEWAY_PORT:-18544}"
@@ -75,7 +78,7 @@ SHADE_TREE_EGRESS_ALLOW="$TARGET" \
 SHADE_TREE_ALLOW_PRIVATE_TARGETS=1 \
 SHADE_TREE_BANNER=never \
 SHADE_TREE_EPOCH_SECONDS="$EPOCH_SECONDS" \
-  node "$REPO/packages/node/gateway/gateway.mjs" > "$WORK/gateway.log" 2>&1 &
+  $GATEWAY_CMD > "$WORK/gateway.log" 2>&1 &
 PIDS+=($!)
 node "$HERE/wait-log.mjs" "$WORK/gateway.log" "gateway up on" 30000
 
@@ -194,7 +197,7 @@ SHADE_TREE_ALLOW_PRIVATE_TARGETS=1 \
 SHADE_TREE_BANNER=never \
 SHADE_TREE_EPOCH_SECONDS="$QUEUE_EPOCH_SECONDS" \
 SHADE_TREE_SLOTS="$QUEUE_TIER" \
-  node "$REPO/packages/node/gateway/gateway.mjs" > "$WORK/queue-gateway.log" 2>&1 &
+  $GATEWAY_CMD > "$WORK/queue-gateway.log" 2>&1 &
 PIDS+=($!)
 node "$HERE/wait-log.mjs" "$WORK/queue-gateway.log" "gateway up on" 30000
 

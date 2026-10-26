@@ -11,6 +11,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
+# The node under test: the JavaScript gateway by default, or a Rust shadenet-node binary
+# (ADR 0014) when SHADE_TREE_GATEWAY_CMD names it. Both read the same SHADE_TREE_* variables.
+GATEWAY_CMD="${SHADE_TREE_GATEWAY_CMD:-node $REPO/packages/node/gateway/gateway.mjs}"
 WORK="$(mktemp -d)"
 
 GW_PORT="${SHADE_TREE_PROXY_TEST_GATEWAY_PORT:-18444}"
@@ -59,7 +62,7 @@ SHADE_TREE_GATEWAY_PORT="$GW_PORT" \
 SHADE_TREE_EGRESS_ALLOW="$TARGET" \
 SHADE_TREE_ALLOW_PRIVATE_TARGETS=1 \
 SHADE_TREE_BANNER=never \
-  node "$REPO/packages/node/gateway/gateway.mjs" > "$WORK/gateway.log" 2>&1 &
+  $GATEWAY_CMD > "$WORK/gateway.log" 2>&1 &
 GW_PID=$!
 node "$HERE/wait-log.mjs" "$WORK/gateway.log" "gateway up on" 30000
 

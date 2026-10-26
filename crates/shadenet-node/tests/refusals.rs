@@ -18,6 +18,10 @@ impl Node {
             .env_remove("SHADENET_LOG")
             .env("SHADE_TREE_GATEWAY_PORT", "0")
             .env("SHADE_TREE_LOG_FORMAT", "text")
+            .env(
+                "SHADE_TREE_MEMBERS_FILE",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../group/members.json"),
+            )
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -182,7 +186,7 @@ fn targets_are_checked_before_any_proof_work() {
     );
     assert_eq!(
         node.exchange(b"{\"v\":4,\"target\":\"example.com:443\"}\n"),
-        "{\"ok\":false,\"err\":\"gateway-error\"}\n"
+        "{\"ok\":false,\"err\":\"gate:no-proof\"}\n"
     );
 }
 
@@ -221,6 +225,23 @@ fn conflicting_prefixes_are_a_configuration_error() {
         .expect("run");
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("both set to different values"));
+}
+
+#[test]
+fn a_missing_member_file_and_an_unsupported_admission_are_configuration_errors() {
+    let output = Command::new(env!("CARGO_BIN_EXE_shadenet-node"))
+        .env_remove("SHADE_TREE_MEMBERS_FILE")
+        .env_remove("SHADENET_MEMBERS_FILE")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("SHADE_TREE_MEMBERS_FILE"));
+    let output = Command::new(env!("CARGO_BIN_EXE_shadenet-node"))
+        .env("SHADE_TREE_ADMIT", "invited,staked")
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("SHADE_TREE_ADMIT"));
 }
 
 #[test]

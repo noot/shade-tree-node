@@ -1,10 +1,27 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
     Environment(String),
+    #[error("{name}: {message}")]
+    Setting { name: &'static str, message: String },
+    #[error("failed to read {path}")]
+    ReadFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{path} is not valid JSON")]
+    ParseJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("{path}: {message}")]
+    FileContent { path: PathBuf, message: String },
     #[error("failed to bind {addr}")]
     Bind {
         addr: SocketAddr,
@@ -31,7 +48,11 @@ impl Error {
     /// Process exit code: 2 for configuration, 1 for a runtime failure.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Environment(_) => 2,
+            Self::Environment(_)
+            | Self::Setting { .. }
+            | Self::ReadFile { .. }
+            | Self::ParseJson { .. }
+            | Self::FileContent { .. } => 2,
             Self::Bind { .. }
             | Self::LocalAddr { .. }
             | Self::Signal { .. }

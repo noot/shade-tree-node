@@ -7,12 +7,21 @@ ShadeNet was formerly Shade Tree Grove; entries below keep the names they shippe
 ### The node moves to Rust: foundations (ADR 0014)
 
 - New crate `crates/shadenet-node` and binary `shadenet-node`. One entrypoint: `main.rs` resolves
-  a `Config` from `SHADENET_*` / `SHADE_TREE_*` and hands it to `ShadeNode`. This first slice
-  listens on `127.0.0.1:$SHADE_TREE_GATEWAY_PORT`, applies the connection cap, the 64 KiB
-  envelope line with its deadline, the protocol version gate and the egress target policy, and
-  answers each refusal byte for byte as the JavaScript node does. Proof verification is not wired
-  in yet: a well-formed v4 envelope is answered `gateway-error` and logged. Sessions answer
-  `session-unsupported`. SIGTERM drains open connections for `SHADE_TREE_SHUTDOWN_TIMEOUT_MS`.
+  a `Config` from `SHADENET_*` / `SHADE_TREE_*` and hands it to `ShadeNode`. It serves the v4
+  tunnel path end to end on an invited member set (`SHADE_TREE_MEMBERS_FILE`): connection cap,
+  the 64 KiB envelope line with its deadline, the version gate, the egress target policy, the
+  `verifyEnvelope` order (epoch, share binding, target binding, root, artifact set, Groth16), the
+  spent set with its honest-retry window, over-spend detection (secret reconstruction and tier
+  resolution; slashing logs as a dry run, on-chain submission comes with on-chain roots), the
+  per-nullifier connection cap, the 40 MiB payload allowance per slot shared by both directions
+  and by retries, public-address-only DNS, pinned sequential dial under one deadline, signed
+  receipts (`SHADE_TREE_RECEIPTS=1`), the spent-set snapshot file, and the relay with one idle
+  timer. Every acknowledgement and refusal is byte for byte what the JavaScript node sends.
+  Not yet: on-chain roots (`SHADE_TREE_ADMIT=staked|paid` is refused at startup), session
+  tickets (answered `session-unsupported`), metrics, the heartbeat and the Tor supervisor.
+- The interop harness (`crates/shadenet-rln/interop/*.sh`) takes `SHADE_TREE_GATEWAY_CMD` and
+  passes the member set through `SHADE_TREE_MEMBERS_FILE` instead of overwriting
+  `group/members.json`; CI runs the four plain-TCP scripts against both nodes.
 - `shadenet-rln` gains a `verify` module (snarkjs key and proof parsing with curve and subgroup
   checks, Groth16 pairing check) that the prover and the withdraw builder now use for their
   self-checks, and a default-on `prove` feature. With `--no-default-features` the crate is the

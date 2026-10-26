@@ -106,6 +106,29 @@ jobs:
       - name: Rust Proxy 8 concurrent tunnels + structured 429 + status endpoint (blocking)
         run: bash crates/shadenet-rln/interop/proxy-concurrency-run.sh
 
+      - name: Build the Rust node (ADR 0014)
+        run: cargo build --locked -p shadenet-node
+
+      - name: Rust client -> Rust node + payload relay (blocking)
+        run: bash crates/shadenet-rln/interop/egress-run.sh
+        env:
+          SHADE_TREE_GATEWAY_CMD: ${{ github.workspace }}/target/debug/shadenet-node
+
+      - name: Rust CONNECT Proxy -> Rust node + early payload (blocking)
+        run: bash crates/shadenet-rln/interop/proxy-run.sh
+        env:
+          SHADE_TREE_GATEWAY_CMD: ${{ github.workspace }}/target/debug/shadenet-node
+
+      - name: Rust failover + last-known-good canopy against the Rust node (blocking)
+        run: bash crates/shadenet-rln/interop/failover-lkg-run.sh
+        env:
+          SHADE_TREE_GATEWAY_CMD: ${{ github.workspace }}/target/debug/shadenet-node
+
+      - name: Rust Proxy 8 concurrent tunnels against the Rust node (blocking)
+        run: bash crates/shadenet-rln/interop/proxy-concurrency-run.sh
+        env:
+          SHADE_TREE_GATEWAY_CMD: ${{ github.workspace }}/target/debug/shadenet-node
+
       - name: Install Foundry (Anvil + forge for the member lifecycle)
         uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:

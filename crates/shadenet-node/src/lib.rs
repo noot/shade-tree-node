@@ -12,6 +12,12 @@ mod egress;
 mod envelope;
 mod error;
 mod node;
+mod receipt;
+mod roots;
+mod slash;
+mod spent;
+mod tunnel;
+mod verify;
 
 pub use config::Config;
 pub use error::Error;

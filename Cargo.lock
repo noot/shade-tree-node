@@ -5883,10 +5883,16 @@ dependencies = [
 name = "shadenet-node"
 version = "0.7.5"
 dependencies = [
+ "ark-bn254",
+ "ark-ff",
  "clap",
+ "hex",
+ "num-bigint",
+ "serde",
  "serde_json",
  "shadenet",
  "shadenet-proto",
+ "shadenet-rln",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
